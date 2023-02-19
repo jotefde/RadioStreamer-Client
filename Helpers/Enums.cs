@@ -19,6 +19,8 @@ namespace RadioStreamer_Client
         TRANSFER,
         END_UPLOAD,
 
+        REQUEST_NEXT_TRACK,
+
         INFO_SYNC,
         INFO_CURRENT_TRACK,
         INFO_PLAYLIST_TRACK,

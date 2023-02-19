@@ -38,6 +38,7 @@ namespace RadioStreamer_Client
         private MemoryStream _audioStream;
         private int _receivedBytes = 0;
         private int _currentTrackBytes = 0;
+        private int _currentPlayedBytes = 1;
         private Thread T_receiveStream;
         private Thread T_processBuffer;
         private Thread T_player;
@@ -132,16 +133,16 @@ namespace RadioStreamer_Client
         public RelayCommand ConnectCommand { get; set; }
         private async void connect(object obj)
         {
-            IsBusy = true;
+            /*IsBusy = true;
             IPHostEntry ipHostInfo = Dns.GetHostEntry(Host);
-            IPAddress ipAddress = ipHostInfo.AddressList[1];
-            IPEndPoint ipEndPoint = new IPEndPoint(ipAddress, Port);
+            IPAddress ipAddress = ipHostInfo.AddressList[0];
+            IPEndPoint ipEndPoint = new IPEndPoint(ipAddress, Port);*/
             if (_socket != null)
                 _socket.Shutdown(SocketShutdown.Both);
             try
             {
-                _socket = new Socket(ipEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                await _socket.ConnectAsync(ipEndPoint);
+                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await _socket.ConnectAsync(Host, Port);
             }
             catch(Exception ex)
             {
@@ -177,7 +178,7 @@ namespace RadioStreamer_Client
 
         private void receiveStream()
         {
-            var tempBuff = new byte[1_024];
+            var tempBuff = new byte[1_024*2];
             while (true)
             {
                 if (!_socket.Connected)
@@ -185,7 +186,7 @@ namespace RadioStreamer_Client
                 int tempRecv = 0;
                 try
                 {
-                    tempRecv = _socket.Receive(tempBuff);
+                    tempRecv = _socket.Receive(tempBuff, 1024 * 2, SocketFlags.None);
                 }
                 catch(Exception ex)
                 {
@@ -196,7 +197,6 @@ namespace RadioStreamer_Client
                 var command = getCommand(tempBuff);
                 if(command != Command.NONE)
                 {
-                    Console.WriteLine(command);
                     switch (command)
                     {
                         case Command.INFO_SYNC:
@@ -236,16 +236,15 @@ namespace RadioStreamer_Client
         private void syncCurrentTrack(byte[] data, int dataSize)
         {
             string message = getMessage(data, dataSize);
+            Console.WriteLine(message);
             var tempTrack = parseTrackData(message);
-            Console.WriteLine(_isForceSync);
             if (_isForceSync)
             {
-                CurrentTrack = parseTrackData(message);
-                Console.WriteLine("Force sync, stop streaming");
-                StopStreaming();
-                Console.WriteLine("Force sync, start streaming");
-                StartStreaming();
+                CurrentTrack = tempTrack;
+                clearStream();
+                Console.WriteLine("Audio stream cleared");
                 _isForceSync = false;
+                _nextTrack = null;
             }
             else
             {
@@ -270,16 +269,15 @@ namespace RadioStreamer_Client
                 .Select(pair => pair.Split('='))
                 .Where(pair => pair.Length == 2)
                 .ToDictionary(sp => sp[0], sp => sp[1]);
-            if (values.Count != 4)
-                return new TrackEntry();
-
-            return new TrackEntry
-            {
-                Index = Convert.ToInt32(values["Index"]),
-                Title = values["Title"],
-                Time = TimeSpan.FromSeconds(Convert.ToInt32(values["Time"])),
-                Duration = TimeSpan.FromSeconds(Convert.ToInt32(values["Duration"]))
-            };
+            var track = new TrackEntry();
+            if (values.Count != 5)
+                return track;
+            track.Index = Convert.ToInt32(values["Index"]);
+            track.Title = values["Title"];
+            track.Time = TimeSpan.FromSeconds(Convert.ToInt32(values["Time"]));
+            track.Duration = TimeSpan.FromSeconds(Convert.ToInt32(values["Duration"]));
+            track.Length = Convert.ToInt64(values["Length"]);
+            return track;
         }
 
         private Command getCommand(byte[] package)
@@ -297,7 +295,7 @@ namespace RadioStreamer_Client
         {
             var messageBytes = new byte[dataSize - 4];
             Buffer.BlockCopy(data, 4, messageBytes, 0, dataSize - 4);
-            return System.Text.Encoding.UTF8.GetString(messageBytes);
+            return Encoding.UTF8.GetString(messageBytes);
         }
 
         private void processBuffer()
@@ -322,6 +320,7 @@ namespace RadioStreamer_Client
                     _audioStream.Position = 0;
                     var written = _audioStream.Read(buff, 0, availableBufferSpace);
                     _bufferProvider.AddSamples(buff, 0, written);
+                    _currentPlayedBytes += written;
                     _receivedBytes -= written;
                     _currentTrackBytes -= written;
                     if (_isNewTrack)
@@ -330,8 +329,18 @@ namespace RadioStreamer_Client
                         {
                             Task.Factory.StartNew(async () =>
                             {
-                                await Task.Delay(5000);
-                                CurrentTrack = _nextTrack;
+                                if (CurrentTrack?.IsEmpty == false)
+                                    await Task.Delay(5000);
+                                if (_nextTrack != null)
+                                {
+                                    _currentPlayedBytes = Convert.ToInt32((_nextTrack.Time.TotalSeconds / _nextTrack.Duration.TotalSeconds) * _nextTrack.Length);
+                                    if (CurrentTrack?.IsEmpty == true)
+                                        _currentPlayedBytes -= _bufferProvider.BufferLength;
+                                    CurrentTrack = _nextTrack;
+                                }
+                                _nextTrack = null;
+                                _player.Stop();
+                                _player.Play();
                             });
                             _isNewTrack = false;
                         }
@@ -347,16 +356,56 @@ namespace RadioStreamer_Client
         }
         private void serverStatus()
         {
-            while(true)
+            Task.Factory.StartNew(async () =>
             {
-                IsConnected = _socket != null && _socket.Connected;
-                if(IsPlaying)
+                bool requestedForNextTrack = false;
+                while (true)
                 {
-                    /*Console.WriteLine($"Buffered bytes: {_bufferProvider.BufferedBytes}");
-                    Console.WriteLine($"Buffered duration: {_bufferProvider.BufferedDuration}");
-                    Console.WriteLine($"Buffer length: {_bufferProvider.BufferLength}");*/
+                    IsConnected = _socket != null && _socket.Connected;
+                    if (IsPlaying)
+                    {
+                        Console.WriteLine($"Buffered bytes: {_bufferProvider.BufferedBytes}");
+                        Console.WriteLine($"Buffered duration: {_bufferProvider.BufferedDuration}");
+                        Console.WriteLine($"Buffer length: {_bufferProvider.BufferLength}");
+                        if (CurrentTrack?.IsEmpty == false)
+                        {
+                            var playedPercentage = (double)_currentPlayedBytes / (double)_currentTrack.Length;
+                            if (playedPercentage > 0.85)
+                            {
+                                Console.WriteLine(playedPercentage);
+                                if (_nextTrack == null && !requestedForNextTrack)
+                                {
+                                    requestedForNextTrack = true;
+                                    SendCommand(Command.REQUEST_NEXT_TRACK);
+                                }
+                            }
+                            else
+                            {
+                                requestedForNextTrack = false;
+                            }
+                            CurrentTrack.Time = TimeSpan.FromSeconds(playedPercentage * _currentTrack.Duration.TotalSeconds);
+                        }
+                    }
+                    await Task.Delay(1000);
                 }
-                Thread.Sleep(5000);
+            });
+            
+        }
+
+        private void clearStream()
+        {
+            _player.Stop();
+            lock (_bufferSyncLock)
+            {
+                T_processBuffer.Abort();
+                T_player.Abort();
+                _receivedBytes = _currentTrackBytes = 0;
+                _audioStream = new MemoryStream();
+                _bufferProvider.ClearBuffer();
+                T_processBuffer = new Thread(new ThreadStart(processBuffer));
+                T_player = new Thread(new ThreadStart(_player.Play));
+                T_processBuffer.Start();
+                T_player.Start();
             }
         }
 
@@ -420,7 +469,7 @@ namespace RadioStreamer_Client
 
         public MainVM()
         {
-            Host = "localhost";
+            Host = "192.168.1.2";
             Port = 1337;
             //_audioStream = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(32, 2));
             PlayCommand = new RelayCommand(play);
@@ -440,9 +489,10 @@ namespace RadioStreamer_Client
             T_serverStatus.Start();
             CurrentTrack = new TrackEntry
             {
-                Duration = TimeSpan.FromSeconds(142),
-                Time = TimeSpan.FromSeconds(79),
-                Title = "Some track title"
+                Duration = TimeSpan.FromSeconds(0),
+                Time = TimeSpan.FromSeconds(0),
+                Title = " - ",
+                Length = 0
             };
             TrackQueue = new ObservableCollection<TrackEntry> { 
                 new TrackEntry {Title = "Track #1"},

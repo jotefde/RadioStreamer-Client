@@ -12,6 +12,7 @@ namespace RadioStreamer_Client.Helpers
         private string _title;
         private TimeSpan _time;
         private TimeSpan _duration;
+        private long _length;
 
         public string Title { get => _title;
             set
@@ -42,5 +43,16 @@ namespace RadioStreamer_Client.Helpers
                 OnPropertyChanged();
             }
         }
+
+        public long Length { get => _length;
+            set
+            {
+                _length = value;
+                OnPropertyChanged();
+                OnPropertyChanged("IsEmpty");
+            }
+        }
+
+        public bool IsEmpty => _length == 0;
     }
 }
